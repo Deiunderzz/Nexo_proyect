@@ -1,16 +1,19 @@
 import os
 import shutil
-import re
+import jwt
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
+from typing import List
 
 from auth import (
     iniciar_sesion, 
-    verificar_otp_empresa, # 👈 NUEVO MÓDULO EXCLUSIVO
+    verificar_otp_empresa,
     completar_registro_usuario, 
     confirmar_codigo_correo, 
-    pre_registrar_cedula,
+    solicitar_recuperacion_contrasena,
+    procesar_cambio_contrasena_otp,
+    obtener_datos_pago_discoteca,
     obtener_discotecas, 
     obtener_layout_discoteca, 
     obtener_menu_botellas, 
@@ -19,64 +22,66 @@ from auth import (
     validar_y_crear_intencion_reserva, 
     registrar_pago_reserva_en_bd,
     admin_aprobar_pago_reserva,
-    obtener_historial_usuario
+    validar_entrada_qr_portero,
+    obtener_historial_usuario,
+    JWT_SECRET,
+    JWT_ALGORITHM
 )
-
 from ocr_processor import procesar_cedula
 
 app = FastAPI(
     title="Nexo Core API",
-    description="Backend transaccional de reservas y seguridad para Nexo y Nexo Empresas",
-    version="2.0.0"
+    description="Backend transaccional y de control de accesos para Nexo",
+    version="3.0.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-CARPETA_TEMPORAL = "temp_uploads"
-os.makedirs(CARPETA_TEMPORAL, exist_ok=True)
+UPLOAD_DIR = "./comprobantes_pago"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs("./temp_cedulas", exist_ok=True)
 
-# MODELOS PYDANTIC
+# --- MODELOS PYDANTIC ---
 class LoginRequest(BaseModel):
     correo: EmailStr
     contrasena: str
 
-class VerificarOtpEmpresaRequest(BaseModel):
+class VerifyOtp2faRequest(BaseModel):
     usuario_id: int
     codigo_otp: str
+
+class RegistroCompletoRequest(BaseModel):
+    token_cedula: str
+    correo: EmailStr
+    telefono: str
+    contrasena: str
 
 class ConfirmarCorreoRequest(BaseModel):
     usuario_id: int
     codigo_otp: str
 
-class CompletarRegistroRequest(BaseModel):
-    nombre: str
-    apellido: str
+class RecuperarClaveRequest(BaseModel):
     correo: EmailStr
-    telefono: str
-    contrasena: str
-    fecha_nacimiento: str
-    edad: int
 
-class PreRegistroCedulaRequest(BaseModel):
-    nombre: str
-    apellido: str
-    fecha_nacimiento: str
-    edad: int
+class CambiarClaveOTPRequest(BaseModel):
+    correo: EmailStr
+    codigo_otp: str
+    nueva_contrasena: str
 
-class BotellaPedido(BaseModel):
+class ItemBotella(BaseModel):
     botella_id: int
     cantidad: int
 
-class IntencionReservaRequest(BaseModel):
+class ReservaRequest(BaseModel):
     usuario_id: int
     mesa_id: int
-    pedido_botellas: list[BotellaPedido]
+    botellas: List[ItemBotella]
 
 class CambiarPrecioRequest(BaseModel):
     botella_id: int
@@ -85,104 +90,107 @@ class CambiarPrecioRequest(BaseModel):
 
 class CambiarConsumoRequest(BaseModel):
     zona_id: int
-    nuevo_minimo_usd: float
+    nuevo_consumo_usd: float
     admin_discoteca_id: int
 
-# ========================================================
-# 🔐 ENDPOINTS DE AUTENTICACIÓN (NEXO / NEXO EMPRESAS)
-# ========================================================
-@app.post("/api/auth/iniciar-sesion")
-def api_iniciar_sesion(data: LoginRequest):
-    """
-    Maneja el inicio de sesión global.
-    Si retorna status 'requires_otp', iOS debe desplegar la vista de Nexo Empresas.
-    """
-    resultado = iniciar_sesion(data.correo, data.contrasena)
-    if resultado["status"] == "error":
-        raise HTTPException(status_code=401, detail=resultado["message"])
-    return resultado
+class ValidarQRRequest(BaseModel):
+    token_qr: str
+    admin_discoteca_id: int
 
-@app.post("/api/auth/verificar-otp-empresa")
-def api_verificar_otp_empresa(data: VerificarOtpEmpresaRequest):
-    """
-    Valida el código de 6 dígitos enviado al correo del dueño de negocio.
-    """
-    resultado = verificar_otp_empresa(data.usuario_id, data.codigo_otp)
-    if resultado["status"] == "error":
-        raise HTTPException(status_code=401, detail=resultado["message"])
-    return resultado
-
-@app.post("/api/auth/scan-cedula")
-async def api_scan_cedula(foto_cedula: UploadFile = File(...)):
-    ruta_guardada = os.path.join(CARPETA_TEMPORAL, f"ocr_{foto_cedula.filename}")
-    with open(ruta_guardada, "wb") as buffer:
-        shutil.copyfileobj(foto_cedula.file, buffer)
+# --- ENDPOINTS ---
+@app.post("/api/auth/escanear-cedula")
+async def api_escanear_cedula(file: UploadFile = File(...)):
+    ruta_temporal = f"./temp_cedulas/{file.filename}"
+    with open(ruta_temporal, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
     
-    resultado = procesar_cedula(ruta_imagen=ruta_guardada)
-    if os.path.exists(ruta_guardada):
-        os.remove(ruta_guardada)
+    resultado_ocr = procesar_cedula(ruta_temporal)
+    if os.path.exists(ruta_temporal):
+        os.remove(ruta_temporal)
         
+    if resultado_ocr["status"] == "error":
+        raise HTTPException(status_code=400, detail=resultado_ocr["message"])
+        
+    datos = resultado_ocr["datos"]
+    token_identidad = jwt.encode(datos, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return {"status": "success", "token_cedula": token_identidad, "datos_extraidos": datos}
+
+@app.post("/api/auth/registro-completo")
+def api_registro_completo(data: RegistroCompletoRequest):
+    resultado = completar_registro_usuario(data.token_cedula, data.correo, data.telefono, data.contrasena)
     if resultado["status"] == "error":
         raise HTTPException(status_code=400, detail=resultado["message"])
     return resultado
 
-@app.post("/api/auth/pre-registro")
-def api_pre_registro(data: PreRegistroCedulaRequest):
-    resultado = pre_registrar_cedula(data.nombre, data.apellido, data.fecha_nacimiento, data.edad)
-    if resultado["status"] == "error":
-        raise HTTPException(status_code=400, detail=resultado["message"])
-    return resultado
-
-@app.post("/api/auth/completar-registro")
-def api_completar_registro(data: CompletarRegistroRequest):
-    resultado = completar_registro_usuario(data.nombre, data.apellido, data.correo, data.telefono, data.contrasena, data.fecha_nacimiento, data.edad)
-    if resultado["status"] == "error":
-        raise HTTPException(status_code=400, detail=resultado["message"])
-    return resultado
-
-@app.post("/api/auth/confirmar-correo")
-def api_confirmar_correo(data: ConfirmarCorreoRequest):
+@app.post("/api/auth/verificar-correo")
+def api_verificar_correo(data: ConfirmarCorreoRequest):
     resultado = confirmar_codigo_correo(data.usuario_id, data.codigo_otp)
     if resultado["status"] == "error":
         raise HTTPException(status_code=400, detail=resultado["message"])
     return resultado
 
-# ========================================================
-# 🗺️ ENDPOINTS DE EXPLORACIÓN Y FLUJO CLIENTE
-# ========================================================
+@app.post("/api/auth/iniciar-sesion")
+def api_login(data: LoginRequest):
+    resultado = iniciar_sesion(data.correo, data.contrasena)
+    if resultado["status"] == "error":
+        raise HTTPException(status_code=401, detail=resultado["message"])
+    return resultado
+
+@app.post("/api/auth/verificar-2fa-corporativo")
+def api_verificar_2fa(data: VerifyOtp2faRequest):
+    resultado = verificar_otp_empresa(data.usuario_id, data.codigo_otp)
+    if resultado["status"] == "error":
+        raise HTTPException(status_code=403, detail=resultado["message"])
+    return resultado
+
+@app.post("/api/auth/recuperar-contrasena")
+def api_solicitar_recuperacion(data: RecuperarClaveRequest):
+    return solicitar_recuperacion_contrasena(data.correo)
+
+@app.post("/api/auth/cambiar-contrasena-otp")
+def api_procesar_cambio(data: CambiarClaveOTPRequest):
+    resultado = procesar_cambio_contrasena_otp(data.correo, data.codigo_otp, data.nueva_contrasena)
+    if resultado["status"] == "error":
+        raise HTTPException(status_code=400, detail=resultado["message"])
+    return resultado
+
 @app.get("/api/discotecas")
-def api_obtener_discotecas():
+def api_listar_discotecas():
     return obtener_discotecas()
 
 @app.get("/api/discotecas/{discoteca_id}/layout")
-def api_obtener_layout(discoteca_id: int):
+def api_layout(discoteca_id: int):
     return obtener_layout_discoteca(discoteca_id)
 
 @app.get("/api/discotecas/{discoteca_id}/menu")
-def api_obtener_menu(discoteca_id: int):
+def api_menu(discoteca_id: int):
     return obtener_menu_botellas(discoteca_id)
 
+@app.get("/api/discotecas/{discoteca_id}/datos-pago")
+def api_datos_pago(discoteca_id: int):
+    resultado = obtener_datos_pago_discoteca(discoteca_id)
+    if resultado["status"] == "error":
+        raise HTTPException(status_code=404, detail=resultado["message"])
+    return resultado
+
 @app.post("/api/reservas/intencion")
-def api_crear_intencion_reserva(data: IntencionReservaRequest):
-    pedido_lista = [{"botella_id": item.botella_id, "cantidad": item.cantidad} for item in data.pedido_botellas]
-    resultado = validar_y_crear_intencion_reserva(data.usuario_id, data.mesa_id, pedido_lista)
+def api_crear_intencion(data: ReservaRequest):
+    lista_dict = [{"botella_id": b.botella_id, "cantidad": b.cantidad} for b in data.botellas]
+    resultado = validar_y_crear_intencion_reserva(data.usuario_id, data.mesa_id, lista_dict)
     if resultado["status"] == "error":
         raise HTTPException(status_code=400, detail=resultado["message"])
     return resultado
 
 @app.post("/api/reservas/pagar")
-def api_registrar_pago(
+async def api_registrar_pago(
     reserva_id: int = Form(...),
     metodo_pago: str = Form(...),
     referencia_bancaria: str = Form(...),
     foto_captura: UploadFile = File(None)
 ):
-    if not re.match(r"^\d{4}$", referencia_bancaria):
-        raise HTTPException(status_code=400, detail="La referencia bancaria debe contener exactamente 4 dígitos.")
-
     ruta_guardada = None
     if foto_captura:
-        ruta_guardada = os.path.join(CARPETA_TEMPORAL, f"capture_{reserva_id}_{foto_captura.filename}")
+        ruta_guardada = os.path.join(UPLOAD_DIR, f"reserva_{reserva_id}_{foto_captura.filename}")
         with open(ruta_guardada, "wb") as buffer:
             shutil.copyfileobj(foto_captura.file, buffer)
 
@@ -191,13 +199,6 @@ def api_registrar_pago(
         raise HTTPException(status_code=400, detail=resultado["message"])
     return resultado
 
-@app.get("/api/usuarios/{usuario_id}/historial")
-def api_historial_usuario(usuario_id: int):
-    return obtener_historial_usuario(usuario_id)
-
-# ========================================================
-# 👑 PANEL NEXO EMPRESAS (Mantenimiento, Stock y Precios)
-# ========================================================
 @app.put("/api/admin/reservas/{reserva_id}/aprobar")
 def api_admin_aprobar_pago(reserva_id: int):
     resultado = admin_aprobar_pago_reserva(reserva_id)
@@ -205,9 +206,19 @@ def api_admin_aprobar_pago(reserva_id: int):
         raise HTTPException(status_code=400, detail=resultado["message"])
     return resultado
 
+@app.post("/api/admin/reservas/validar-qr")
+def api_validar_puerta_qr(data: ValidarQRRequest):
+    resultado = validar_entrada_qr_portero(data.token_qr, data.admin_discoteca_id)
+    if resultado["status"] == "error":
+        raise HTTPException(status_code=403, detail=resultado["message"])
+    return resultado
+
+@app.get("/api/usuarios/{usuario_id}/historial")
+def api_historial_usuario(usuario_id: int):
+    return obtener_historial_usuario(usuario_id)
+
 @app.post("/api/admin/configurar/precios")
 def api_admin_cambiar_precio(data: CambiarPrecioRequest):
-    """Permite al dueño cambiar los precios del menú de licores de su local en tiempo real."""
     resultado = actualizar_precio_botella(data.botella_id, data.nuevo_precio_usd, data.admin_discoteca_id)
     if resultado["status"] == "error":
         raise HTTPException(status_code=403, detail=resultado["message"])
@@ -215,8 +226,7 @@ def api_admin_cambiar_precio(data: CambiarPrecioRequest):
 
 @app.post("/api/admin/configurar/zonas")
 def api_admin_cambiar_consumo(data: CambiarConsumoRequest):
-    """Permite cambiar los consumos mínimos de las zonas VIP o General."""
-    resultado = actualizar_consumo_zona(data.zona_id, data.nuevo_minimo_usd, data.admin_discoteca_id)
+    resultado = actualizar_consumo_zona(data.zona_id, data.nuevo_consumo_usd, data.admin_discoteca_id)
     if resultado["status"] == "error":
         raise HTTPException(status_code=403, detail=resultado["message"])
     return resultado

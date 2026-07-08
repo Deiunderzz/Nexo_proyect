@@ -1,16 +1,19 @@
+import os
 import psycopg2
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def verificar_datos():
     try:
         conexion = psycopg2.connect(
-            host="localhost",
-            database="nexo_db",
-            user="postgres",
-            password="hOMERO20*"
+            host=os.getenv("DB_HOST", "localhost"),
+            database=os.getenv("DB_NAME", "nexo_db"),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASSWORD")
         )
-        cursor = conexion.cursor()
+        cursor = conexion.conexion() if hasattr(conexion, 'conexion') else conexion.cursor()
         
-        # Consultar la tabla de discotecas
         cursor.execute("SELECT id, nombre, ubicacion FROM discotecas;")
         discotecas = cursor.fetchall()
         
