@@ -1,10 +1,12 @@
 import os
 import shutil
+import uuid
+import asyncio
 import jwt
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from typing import List
+from typing import List, Optional
 
 from auth import (
     iniciar_sesion, 
@@ -24,10 +26,15 @@ from auth import (
     admin_aprobar_pago_reserva,
     validar_entrada_qr_portero,
     obtener_historial_usuario,
+    actualizar_estado_mesa,
+    actualizar_datos_pago_discoteca,
     JWT_SECRET,
-    JWT_ALGORITHM
+    JWT_ALGORITHM,
+    DB_CONFIG
 )
+import psycopg2
 from ocr_processor import procesar_cedula
+from bcv_provider import obtener_tasas_bcv
 
 app = FastAPI(
     title="Nexo Core API",
@@ -47,7 +54,7 @@ UPLOAD_DIR = "./comprobantes_pago"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs("./temp_cedulas", exist_ok=True)
 
-# --- MODELOS PYDANTIC ---
+# --- MODELOS PYDANTIC ACTUALIZADOS ---
 class LoginRequest(BaseModel):
     correo: EmailStr
     contrasena: str
@@ -61,10 +68,17 @@ class RegistroCompletoRequest(BaseModel):
     correo: EmailStr
     telefono: str
     contrasena: str
+    nombre: str
+    apellido: str
+    cedula: Optional[str] = None  # Permite corregir el número si la IA lo leyó mal
 
 class ConfirmarCorreoRequest(BaseModel):
     usuario_id: int
     codigo_otp: str
+
+class VerificarOtpPorCorreoRequest(BaseModel):
+    correo: EmailStr
+    otp: str
 
 class RecuperarClaveRequest(BaseModel):
     correo: EmailStr
@@ -83,41 +97,66 @@ class ReservaRequest(BaseModel):
     mesa_id: int
     botellas: List[ItemBotella]
 
-class CambiarPrecioRequest(BaseModel):
-    botella_id: int
-    nuevo_precio_usd: float
+class EstadoMesaRequest(BaseModel):
     admin_discoteca_id: int
+    nuevo_estado: str  # 'libre' | 'bloqueada'
 
-class CambiarConsumoRequest(BaseModel):
-    zona_id: int
-    nuevo_consumo_usd: float
+class DatosPagoRequest(BaseModel):
     admin_discoteca_id: int
-
-class ValidarQRRequest(BaseModel):
-    token_qr: str
-    admin_discoteca_id: int
+    pago_movil_banco: Optional[str] = None
+    pago_movil_telefono: Optional[str] = None
+    pago_movil_cedula_rif: Optional[str] = None
+    pago_movil_titular: Optional[str] = None
+    zelle_correo: Optional[str] = None
+    zelle_titular: Optional[str] = None
+    efectivo_nota: Optional[str] = None
 
 # --- ENDPOINTS ---
 @app.post("/api/auth/escanear-cedula")
 async def api_escanear_cedula(file: UploadFile = File(...)):
-    ruta_temporal = f"./temp_cedulas/{file.filename}"
-    with open(ruta_temporal, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # Asignación de nombre único para evitar colisiones entre peticiones simultáneas
+    extension = os.path.splitext(file.filename)[1]
+    ruta_temporal = f"./temp_cedulas/{uuid.uuid4()}{extension}"
     
-    resultado_ocr = procesar_cedula(ruta_temporal)
-    if os.path.exists(ruta_temporal):
-        os.remove(ruta_temporal)
+    try:
+        with open(ruta_temporal, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
         
-    if resultado_ocr["status"] == "error":
-        raise HTTPException(status_code=400, detail=resultado_ocr["message"])
-        
-    datos = resultado_ocr["datos"]
-    token_identidad = jwt.encode(datos, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return {"status": "success", "token_cedula": token_identidad, "datos_extraidos": datos}
+        # 🚀 Ejecución no bloqueante del OCR en un hilo secundario de CPU
+        resultado_ocr = await asyncio.to_thread(procesar_cedula, ruta_temporal)
+            
+        if resultado_ocr["status"] == "error":
+            raise HTTPException(status_code=400, detail=resultado_ocr["message"])
+            
+        datos = resultado_ocr["datos"]
 
-@app.post("/api/auth/registro-completo")
+        # Bloqueo duro: si la IA determina que es menor de edad, no se emite token
+        # y el flujo de registro no puede continuar.
+        if not datos.get("es_mayor_edad"):
+            raise HTTPException(status_code=403, detail="Debes ser mayor de 18 años para registrarte en Nexo.")
+
+        token_identidad = jwt.encode(datos, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        return {"status": "success", "token_cedula": token_identidad, "datos_extraidos": datos}
+
+    finally:
+        # Garantiza que los archivos temporales se eliminen sin importar el resultado
+        if os.path.exists(ruta_temporal):
+            try:
+                os.remove(ruta_temporal)
+            except Exception:
+                pass
+
+@app.post("/api/auth/registrar")
 def api_registro_completo(data: RegistroCompletoRequest):
-    resultado = completar_registro_usuario(data.token_cedula, data.correo, data.telefono, data.contrasena)
+    resultado = completar_registro_usuario(
+        data.token_cedula, 
+        data.correo, 
+        data.telefono, 
+        data.contrasena, 
+        data.nombre, 
+        data.apellido,
+        cedula_manual=data.cedula
+    )
     if resultado["status"] == "error":
         raise HTTPException(status_code=400, detail=resultado["message"])
     return resultado
@@ -128,6 +167,26 @@ def api_verificar_correo(data: ConfirmarCorreoRequest):
     if resultado["status"] == "error":
         raise HTTPException(status_code=400, detail=resultado["message"])
     return resultado
+
+@app.post("/api/auth/verificar-otp")
+def api_verificar_otp_por_correo(data: VerificarOtpPorCorreoRequest):
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conexion:
+            with conexion.cursor() as cursor:
+                cursor.execute("SELECT id FROM usuarios WHERE correo = %s;", (data.correo.strip().lower(),))
+                usuario = cursor.fetchone()
+                if not usuario:
+                    raise HTTPException(status_code=404, detail="Usuario no encontrado con ese correo electrónico.")
+                usuario_id = usuario[0]
+                
+        resultado = confirmar_codigo_correo(usuario_id, data.otp.strip())
+        if resultado["status"] == "error":
+            raise HTTPException(status_code=400, detail=resultado["message"])
+        return resultado
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/auth/iniciar-sesion")
 def api_login(data: LoginRequest):
@@ -158,6 +217,14 @@ def api_procesar_cambio(data: CambiarClaveOTPRequest):
 def api_listar_discotecas():
     return obtener_discotecas()
 
+@app.get("/api/tasa-bcv")
+def api_tasa_bcv():
+    # Solo para mostrar un estimado en pantalla antes de pagar. El monto real
+    # en Bs. que se cobra siempre se recalcula en el servidor al reportar el
+    # pago (ver registrar_pago_reserva_en_bd), así que esto nunca es la fuente
+    # de verdad financiera, solo una referencia visual para el usuario.
+    return obtener_tasas_bcv()
+
 @app.get("/api/discotecas/{discoteca_id}/layout")
 def api_layout(discoteca_id: int):
     return obtener_layout_discoteca(discoteca_id)
@@ -171,6 +238,21 @@ def api_datos_pago(discoteca_id: int):
     resultado = obtener_datos_pago_discoteca(discoteca_id)
     if resultado["status"] == "error":
         raise HTTPException(status_code=404, detail=resultado["message"])
+    return resultado
+
+@app.put("/api/admin/discotecas/{discoteca_id}/datos-pago")
+def api_actualizar_datos_pago(discoteca_id: int, data: DatosPagoRequest):
+    payload = data.dict(exclude={"admin_discoteca_id"})
+    resultado = actualizar_datos_pago_discoteca(discoteca_id, payload, data.admin_discoteca_id)
+    if resultado["status"] == "error":
+        raise HTTPException(status_code=400, detail=resultado["message"])
+    return resultado
+
+@app.put("/api/admin/mesas/{mesa_id}/estado")
+def api_actualizar_estado_mesa(mesa_id: int, data: EstadoMesaRequest):
+    resultado = actualizar_estado_mesa(mesa_id, data.nuevo_estado, data.admin_discoteca_id)
+    if resultado["status"] == "error":
+        raise HTTPException(status_code=400, detail=resultado["message"])
     return resultado
 
 @app.post("/api/reservas/intencion")
@@ -193,40 +275,10 @@ async def api_registrar_pago(
         ruta_guardada = os.path.join(UPLOAD_DIR, f"reserva_{reserva_id}_{foto_captura.filename}")
         with open(ruta_guardada, "wb") as buffer:
             shutil.copyfileobj(foto_captura.file, buffer)
-
+            
     resultado = registrar_pago_reserva_en_bd(reserva_id, metodo_pago, referencia_bancaria, ruta_guardada)
     if resultado["status"] == "error":
+        if ruta_guardada and os.path.exists(ruta_guardada):
+            os.remove(ruta_guardada)
         raise HTTPException(status_code=400, detail=resultado["message"])
-    return resultado
-
-@app.put("/api/admin/reservas/{reserva_id}/aprobar")
-def api_admin_aprobar_pago(reserva_id: int):
-    resultado = admin_aprobar_pago_reserva(reserva_id)
-    if resultado["status"] == "error":
-        raise HTTPException(status_code=400, detail=resultado["message"])
-    return resultado
-
-@app.post("/api/admin/reservas/validar-qr")
-def api_validar_puerta_qr(data: ValidarQRRequest):
-    resultado = validar_entrada_qr_portero(data.token_qr, data.admin_discoteca_id)
-    if resultado["status"] == "error":
-        raise HTTPException(status_code=403, detail=resultado["message"])
-    return resultado
-
-@app.get("/api/usuarios/{usuario_id}/historial")
-def api_historial_usuario(usuario_id: int):
-    return obtener_historial_usuario(usuario_id)
-
-@app.post("/api/admin/configurar/precios")
-def api_admin_cambiar_precio(data: CambiarPrecioRequest):
-    resultado = actualizar_precio_botella(data.botella_id, data.nuevo_precio_usd, data.admin_discoteca_id)
-    if resultado["status"] == "error":
-        raise HTTPException(status_code=403, detail=resultado["message"])
-    return resultado
-
-@app.post("/api/admin/configurar/zonas")
-def api_admin_cambiar_consumo(data: CambiarConsumoRequest):
-    resultado = actualizar_consumo_zona(data.zona_id, data.nuevo_consumo_usd, data.admin_discoteca_id)
-    if resultado["status"] == "error":
-        raise HTTPException(status_code=403, detail=resultado["message"])
     return resultado

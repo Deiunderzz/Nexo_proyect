@@ -34,7 +34,7 @@ def validar_complejidad_contrasena(contrasena):
     if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", contrasena): return False
     return True
 
-def completar_registro_usuario(token_cedula, correo, telefono, contrasena):
+def completar_registro_usuario(token_cedula, correo, telefono, contrasena, nombre, apellido, cedula_manual=None):
     try:
         try:
             payload = jwt.decode(token_cedula, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -43,11 +43,32 @@ def completar_registro_usuario(token_cedula, correo, telefono, contrasena):
         except jwt.InvalidTokenError:
             return {"status": "error", "message": "Firma inválida o alteración detectada."}
 
-        cedula = payload.get("cedula")
-        nombre = payload.get("nombre")
-        apellido = payload.get("apellido")
+        # El número de cédula lo sugiere la IA, pero el usuario puede corregirlo
+        cedula = (cedula_manual or payload.get("cedula") or "").strip() or None
         fecha_nacimiento_str = payload.get("fecha_nacimiento")
+
+        # El OCR entrega la fecha como DD/MM/AAAA (string). Si se manda tal cual,
+        # Postgres la interpreta según su DateStyle (normalmente MDY) y "20/05/2006"
+        # revienta porque el mes 20 no existe. Se convierte a un date real aquí para
+        # que psycopg2 la envíe sin ambigüedad, sin importar el DateStyle del servidor.
+        fecha_nacimiento = None
+        if fecha_nacimiento_str:
+            try:
+                fecha_nacimiento = datetime.strptime(fecha_nacimiento_str, "%d/%m/%Y").date()
+            except ValueError:
+                return {"status": "error", "message": "Fecha de nacimiento inválida en el documento escaneado. Vuelve a escanear."}
         edad = payload.get("edad")
+
+        nombre = (nombre or "").strip()
+        apellido = (apellido or "").strip()
+        if not nombre or not apellido:
+            return {"status": "error", "message": "Nombre y apellido son requeridos."}
+
+        # Segunda comprobación de edad, independiente de la que ya se hizo al escanear:
+        # el token no debe poder usarse para registrar a un menor de edad aunque el
+        # endpoint de escaneo cambie en el futuro.
+        if edad is None or edad < 18:
+            return {"status": "error", "message": "Debes ser mayor de 18 años para registrarte en Nexo."}
 
         if not validar_complejidad_contrasena(contrasena):
             return {"status": "error", "message": "La contraseña no cumple los requisitos mínimos de robustez."}
@@ -62,7 +83,7 @@ def completar_registro_usuario(token_cedula, correo, telefono, contrasena):
                     INSERT INTO usuarios (nombre, apellido, correo, telefono, contrasena, fecha_nacimiento, edad, verificado, rol, cedula)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, 'cliente', %s) RETURNING id;
                     """,
-                    (nombre, apellido, correo, telefono, clave_hasheada, fecha_nacimiento_str, edad, cedula)
+                    (nombre, apellido, correo, telefono, clave_hasheada, fecha_nacimiento, edad, cedula)
                 )
                 usuario_id = cursor.fetchone()[0]
 
@@ -117,7 +138,9 @@ def iniciar_sesion(correo, contrasena):
                 if not verificado: return {"status": "error", "message": "Cuenta no verificada."}
 
                 if rol == 'admin':
-                    codigo_otp = str(random.randint(100000, 999999))
+                    # TEMPORAL: código fijo mientras se resuelve la entrega de correo con Resend.
+                    # Sustituir por random.randint(100000, 999999) una vez el dominio esté verificado.
+                    codigo_otp = "123456"
                     cursor.execute("INSERT INTO codigos_verificacion (usuario_id, codigo_otp, expiracion) VALUES (%s, %s, %s);", (u_id, codigo_otp, datetime.now() + timedelta(minutes=5)))
                     conexion.commit()
                     enviar_otp_corporativo_2fa(correo, codigo_otp)
@@ -202,14 +225,56 @@ def obtener_datos_pago_discoteca(discoteca_id):
     try:
         with psycopg2.connect(**DB_CONFIG) as conexion:
             with conexion.cursor() as cursor:
-                cursor.execute("SELECT nombre FROM discotecas WHERE id = %s;", (discoteca_id,))
-                if not cursor.fetchone(): return {"status": "error", "message": "Establecimiento inválido."}
-                
-                if discoteca_id == 1:
-                    data = {"banco": "Banesco (0134)", "rif": "J-40192831-0", "telefono_pago_movil": "+584121111111", "titular": "KABAL CLUB C.A."}
-                else:
-                    data = {"banco": "Banco Mercantil (0105)", "rif": "J-50129381-2", "telefono_pago_movil": "+584122222222", "titular": "ZOE ROOFTOP C.A."}
+                cursor.execute(
+                    """
+                    SELECT pago_movil_banco, pago_movil_telefono, pago_movil_cedula_rif, pago_movil_titular,
+                           zelle_correo, zelle_titular, efectivo_nota
+                    FROM discotecas WHERE id = %s;
+                    """, (discoteca_id,)
+                )
+                fila = cursor.fetchone()
+                if not fila: return {"status": "error", "message": "Establecimiento inválido."}
+
+                pm_banco, pm_telefono, pm_cedula_rif, pm_titular, zelle_correo, zelle_titular, efectivo_nota = fila
+                data = {
+                    "pago_movil": {
+                        "banco": pm_banco, "telefono": pm_telefono,
+                        "cedula_rif": pm_cedula_rif, "titular": pm_titular
+                    },
+                    "zelle": {"correo": zelle_correo, "titular": zelle_titular},
+                    "efectivo": {"nota": efectivo_nota}
+                }
                 return {"status": "success", "data": data}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def actualizar_datos_pago_discoteca(discoteca_id, datos, admin_discoteca_id):
+    try:
+        # Un admin solo puede editar las cuentas de pago de su propio establecimiento
+        if discoteca_id != admin_discoteca_id:
+            return {"status": "error", "message": "No tienes permiso para editar este establecimiento."}
+
+        with psycopg2.connect(**DB_CONFIG) as conexion:
+            with conexion.cursor() as cursor:
+                cursor.execute("SELECT id FROM discotecas WHERE id = %s;", (discoteca_id,))
+                if not cursor.fetchone(): return {"status": "error", "message": "Establecimiento inválido."}
+
+                cursor.execute(
+                    """
+                    UPDATE discotecas SET
+                        pago_movil_banco = %s, pago_movil_telefono = %s, pago_movil_cedula_rif = %s, pago_movil_titular = %s,
+                        zelle_correo = %s, zelle_titular = %s, efectivo_nota = %s
+                    WHERE id = %s;
+                    """,
+                    (
+                        datos.get("pago_movil_banco"), datos.get("pago_movil_telefono"),
+                        datos.get("pago_movil_cedula_rif"), datos.get("pago_movil_titular"),
+                        datos.get("zelle_correo"), datos.get("zelle_titular"),
+                        datos.get("efectivo_nota"), discoteca_id
+                    )
+                )
+                conexion.commit()
+        return {"status": "success", "message": "Datos de pago actualizados correctamente."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -229,13 +294,13 @@ def obtener_layout_discoteca(discoteca_id):
             with conexion.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT m.id, m.identificador_mesa, m.posicion_x, m.posicion_y, z.nombre_zona, z.consumo_minimo_usd,
+                    SELECT m.id, m.identificador_mesa, m.posicion_x, m.posicion_y, z.nombre_zona, z.consumo_minimo_usd, m.estado,
                            EXISTS (SELECT 1 FROM reservas r WHERE r.mesa_id = m.id AND r.estado IN ('pendiente', 'aprobado', 'esperando_aprobacion') AND r.expiracion_reserva > NOW()) as ocupada
                     FROM mesas m JOIN zonas_discoteca z ON m.zona_id = z.id WHERE m.discoteca_id = %s;
                     """, (discoteca_id,)
                 )
                 mesas = cursor.fetchall()
-                return {"status": "success", "data": [{"mesa_id": m[0], "identificador": m[1], "x": m[2], "y": m[3], "zona": m[4], "consumo_minimo_usd": float(m[5]), "ocupada": m[6]} for m in mesas]}
+                return {"status": "success", "data": [{"mesa_id": m[0], "identificador": m[1], "x": m[2], "y": m[3], "zona": m[4], "consumo_minimo_usd": float(m[5]), "estado": m[6], "ocupada": m[7]} for m in mesas]}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -275,15 +340,35 @@ def actualizar_consumo_zona(zona_id, nuevo_consumo, admin_discoteca_id):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+def actualizar_estado_mesa(mesa_id, nuevo_estado, admin_discoteca_id):
+    try:
+        if nuevo_estado not in ("libre", "bloqueada"):
+            return {"status": "error", "message": "Estado inválido. Usa 'libre' o 'bloqueada'."}
+
+        with psycopg2.connect(**DB_CONFIG) as conexion:
+            with conexion.cursor() as cursor:
+                cursor.execute("SELECT discoteca_id FROM mesas WHERE id = %s;", (mesa_id,))
+                res = cursor.fetchone()
+                if not res or res[0] != admin_discoteca_id:
+                    return {"status": "error", "message": "Acceso denegado."}
+
+                cursor.execute("UPDATE mesas SET estado = %s WHERE id = %s;", (nuevo_estado, mesa_id))
+                conexion.commit()
+        return {"status": "success", "message": f"Mesa marcada como '{nuevo_estado}'.", "estado": nuevo_estado}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 def validar_y_crear_intencion_reserva(usuario_id, mesa_id, lista_botellas):
     try:
         with psycopg2.connect(**DB_CONFIG) as conexion:
             with conexion.cursor() as cursor:
-                cursor.execute("SELECT m.id, z.id, z.consumo_minimo_usd FROM mesas m JOIN zonas_discoteca z ON m.zona_id = z.id WHERE m.id = %s FOR UPDATE;", (mesa_id,))
+                cursor.execute("SELECT m.id, z.id, z.consumo_minimo_usd, m.estado FROM mesas m JOIN zonas_discoteca z ON m.zona_id = z.id WHERE m.id = %s FOR UPDATE;", (mesa_id,))
                 mesa_info = cursor.fetchone()
                 if not mesa_info: return {"status": "error", "message": "Mesa no encontrada."}
                 
-                id_mesa, zona_id, consumo_minimo = mesa_info
+                id_mesa, zona_id, consumo_minimo, estado_mesa = mesa_info
+                if estado_mesa == 'bloqueada':
+                    return {"status": "error", "message": "Esta mesa está bloqueada temporalmente por el establecimiento."}
                 cursor.execute("SELECT id FROM reservas WHERE mesa_id = %s AND estado IN ('pendiente', 'aprobado', 'esperando_aprobacion') AND expiracion_reserva > NOW();", (mesa_id,))
                 if cursor.fetchone(): return {"status": "error", "message": "Mesa ocupada en este momento."}
 
@@ -310,7 +395,7 @@ def validar_y_crear_intencion_reserva(usuario_id, mesa_id, lista_botellas):
                 reserva_id = cursor.fetchone()[0]
 
                 for b_id, cant in detalles_insercion:
-                    cursor.execute("INSERT INTO detalles_reserva_botellas (reserva_id, botella_id, Comprehensive) VALUES (%s, %s, %s);", (reserva_id, b_id, cant))
+                    cursor.execute("INSERT INTO detalles_reserva_botellas (reserva_id, botella_id, cantidad) VALUES (%s, %s, %s);", (reserva_id, b_id, cant))
                     cursor.execute("UPDATE inventario_botellas SET stock = stock - %s WHERE id = %s;", (cant, b_id))
                 conexion.commit()
 
